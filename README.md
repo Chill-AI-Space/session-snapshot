@@ -12,7 +12,9 @@ When a Claude Code session hits context limits, the session crashes and all conv
 
 1. **Saves snapshots** — a Claude Code hook that periodically copies the session JSONL file (every ~80KB of growth, once the session exceeds ~200KB). One rolling snapshot per session, always up to date.
 
-2. **Auto-restores** — a wrapper (`cclaude`) that detects context overload when Claude exits and automatically restores the session from the last snapshot, resuming where you left off.
+2. **Archives sessions** — every snapshot is also saved to an archive directory that Claude Code won't clean up. Configurable — point it at Google Drive, Dropbox, or any shared folder.
+
+3. **Auto-restores** — detects context overload when Claude exits and automatically restores the session from the last snapshot, resuming where you left off.
 
 ## Components
 
@@ -36,7 +38,7 @@ A [Claude Code hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that 
 
 ### 2. Auto-restore wrapper (`bin/cclaude.sh`)
 
-A bash wrapper around `claude` that adds crash recovery. You run `cclaude` instead of `claude` — all arguments are passed through.
+A bash wrapper around `claude` that adds crash recovery. After install, `claude` is aliased to the wrapper transparently — no need to change how you launch Claude.
 
 **How auto-restore works:**
 1. Runs `claude` with your arguments
@@ -48,7 +50,7 @@ A bash wrapper around `claude` that adds crash recovery. You run `cclaude` inste
 5. Restarts `claude --resume {sessionId}` with a prompt telling the model that context was restored
 6. Loops back to step 2
 
-**Flag preservation:** Remembers flags like `--dangerously-skip-permissions`, `--verbose`, `--debug` across restarts by saving them to `~/.config/session-snapshot/pending-flags.txt`.
+**Flag preservation:** Remembers flags like `--dangerously-skip-permissions`, `--verbose`, `--debug` across restarts.
 
 ### 3. Path resolver (`src/claude-paths.ts`)
 
@@ -99,26 +101,29 @@ cd session-snapshot
 This will:
 - Register `snapshot.ts` as a `PostToolUse` hook (via claude-hooks plugin dir or directly in `~/.claude/settings.json`)
 - Install the `cclaude` wrapper to `~/.local/bin/`
+- Add a shell function so `claude` routes through the wrapper transparently
+- Create a default archive directory at `~/.config/session-snapshot/archive/`
 
 ## Usage
 
-Launch Claude through the wrapper instead of directly:
+Just use `claude` as you always do:
 
 ```bash
-cclaude            # all your usual claude arguments work
-cclaude -p "hi"    # flags are passed through to claude
+claude --dangerously-skip-permissions
 ```
 
-That's it. Snapshots happen automatically in the background. If context overload occurs, the wrapper detects it and restores the session.
+That's it. Snapshots and archiving happen automatically in the background. If context overload occurs, the session is restored automatically.
 
 ## CLI commands
 
 ```bash
-session-snapshot install      # Install plugin + wrapper
-session-snapshot uninstall    # Remove plugin + wrapper
-session-snapshot status       # Show snapshot info
-session-snapshot clean        # Remove all snapshots
-session-snapshot test         # Run self-test
+session-snapshot install                           # Install plugin + wrapper + shell alias
+session-snapshot uninstall                         # Remove everything
+session-snapshot status                            # Show snapshot & archive info
+session-snapshot clean                             # Remove all snapshots
+session-snapshot config                            # Show current config
+session-snapshot config archiveDir ~/Google\ Drive/sessions   # Change archive location
+session-snapshot test                              # Run self-test
 ```
 
 ## File layout
@@ -133,16 +138,33 @@ session-snapshot/
     cli.sh              # CLI for install/uninstall/status/clean/test
 
 ~/.config/session-snapshot/
+  config.json                   # Settings (archiveDir, etc.)
   snapshots/
-    {sessionId}.jsonl       # Snapshot copy of session JSONL
-    {sessionId}.state.json  # Rolling state (count, last size)
-    latest.json             # Pointer for wrapper auto-restore
-  path-cache.json           # Cached session ID -> JSONL path mappings
+    {sessionId}.jsonl           # Rolling snapshot (overwritten each time)
+    {sessionId}.state.json      # Rolling state (count, last size)
+    latest.json                 # Pointer for wrapper auto-restore
+  archive/
+    {project}-{shortId}.jsonl   # Permanent session archive
+  path-cache.json               # Cached session ID -> JSONL path mappings
   logs/
-    snapshot.log            # Debug log (when enabled)
+    snapshot.log                # Debug log (when enabled)
 ```
 
 ## Configuration
+
+Config file: `~/.config/session-snapshot/config.json`
+
+```json
+{
+  "archiveDir": "~/.config/session-snapshot/archive"
+}
+```
+
+Change the archive location (e.g. to a Google Drive sync folder):
+
+```bash
+session-snapshot config archiveDir ~/Google\ Drive/claude-sessions
+```
 
 Environment variables:
 

@@ -15,6 +15,57 @@ ok()    { echo -e "${GREEN}  ✓${NC} $1"; }
 fail()  { echo -e "${RED}  ✗${NC} $1"; }
 warn()  { echo -e "${YELLOW}  !${NC} $1"; }
 
+SHELL_MARKER="# session-snapshot: transparent wrapper"
+
+_detect_shell_rc() {
+  if [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "${SHELL:-bash}")" = "zsh" ]; then
+    echo "$HOME/.zshrc"
+  else
+    echo "$HOME/.bashrc"
+  fi
+}
+
+_install_shell_function() {
+  local rc
+  rc="$(_detect_shell_rc)"
+
+  # Already installed?
+  if [ -f "$rc" ] && grep -qF "$SHELL_MARKER" "$rc"; then
+    ok "Shell function already in $(basename "$rc")"
+    return
+  fi
+
+  cat >> "$rc" << 'FUNC'
+
+# session-snapshot: transparent wrapper
+# Routes `claude` through cclaude for auto-restore on context overload
+claude() { command cclaude "$@"; }
+FUNC
+
+  ok "Shell function added to $(basename "$rc") — claude() → cclaude"
+}
+
+_remove_shell_function() {
+  local rc
+  rc="$(_detect_shell_rc)"
+
+  if [ ! -f "$rc" ] || ! grep -qF "$SHELL_MARKER" "$rc"; then
+    return
+  fi
+
+  # Remove the block (marker + comment + function + blank line before)
+  local tmp="$rc.session-snapshot-bak"
+  awk -v marker="$SHELL_MARKER" '
+    BEGIN { skip=0 }
+    $0 ~ marker { skip=1; next }
+    skip && /^# Routes .* cclaude/ { next }
+    skip && /^claude\(\)/ { skip=0; next }
+    { skip=0; print }
+  ' "$rc" > "$tmp" && mv "$tmp" "$rc"
+
+  ok "Shell function removed from $(basename "$rc")"
+}
+
 # ── install ───────────────────────────────────────────────────
 cmd_install() {
   echo ""
@@ -31,7 +82,20 @@ cmd_install() {
 
   # Create config dirs
   mkdir -p "$SNAPSHOTS_DIR"
+  mkdir -p "$CONFIG_DIR/archive"
   ok "Config directory: $CONFIG_DIR"
+
+  # Create default config if missing
+  if [ ! -f "$CONFIG_DIR/config.json" ]; then
+    cat > "$CONFIG_DIR/config.json" << EOF
+{
+  "archiveDir": "$CONFIG_DIR/archive"
+}
+EOF
+    ok "Config file created: $CONFIG_DIR/config.json"
+  else
+    ok "Config file exists"
+  fi
 
   # Check if claude-hooks is installed
   HOOKS_PLUGINS="$HOME/.config/claude-hooks/plugins"
@@ -96,13 +160,15 @@ fs.writeFileSync('$SETTINGS', JSON.stringify(settings, null, 2) + '\n');
     echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
   fi
 
+  # Add transparent shell function: claude() → cclaude
+  _install_shell_function
+
   echo ""
-  echo -e "${GREEN}${BOLD}Installed!${NC} Restart Claude Code to activate."
+  echo -e "${GREEN}${BOLD}Installed!${NC} Restart your shell to activate."
   echo ""
-  echo "  Usage:"
-  echo "    cclaude --dangerously-skip-permissions     — launch with auto-restore"
-  echo "    session-snapshot status                     — show snapshot info"
-  echo "    session-snapshot clean                      — remove old snapshots"
+  echo "  Just use ${BOLD}claude${NC} as usual — auto-restore is now built in."
+  echo "  session-snapshot status     — show snapshot info"
+  echo "  session-snapshot clean      — remove old snapshots"
   echo ""
 }
 
@@ -143,6 +209,9 @@ fs.writeFileSync('$SETTINGS', JSON.stringify(settings, null, 2) + '\n');
     ok "Wrapper removed"
   fi
 
+  # Remove shell function
+  _remove_shell_function
+
   echo ""
   echo "  Snapshots are still in: $SNAPSHOTS_DIR"
   echo "  To remove everything: rm -rf $CONFIG_DIR"
@@ -170,6 +239,28 @@ cmd_status() {
     ok "Wrapper: available ($(which cclaude))"
   else
     warn "Wrapper: not in PATH"
+  fi
+
+  # Check shell function
+  local rc
+  rc="$(_detect_shell_rc)"
+  if [ -f "$rc" ] && grep -qF "$SHELL_MARKER" "$rc"; then
+    ok "Shell function: active in $(basename "$rc")"
+  else
+    warn "Shell function: not installed (run 'session-snapshot install')"
+  fi
+
+  # Show archive info
+  local archive_dir="$CONFIG_DIR/archive"
+  if [ -f "$CONFIG_DIR/config.json" ]; then
+    archive_dir=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$CONFIG_DIR/config.json','utf-8')).archiveDir || '$CONFIG_DIR/archive')" 2>/dev/null)
+  fi
+  if [ -d "$archive_dir" ]; then
+    local acount=$(ls "$archive_dir"/*.jsonl 2>/dev/null | wc -l | tr -d ' ')
+    local asize=$(du -sh "$archive_dir" 2>/dev/null | cut -f1)
+    ok "Archive: $acount session(s) ($asize) in $archive_dir"
+  else
+    warn "Archive: directory not found ($archive_dir)"
   fi
 
   # Show snapshots
@@ -282,6 +373,50 @@ cmd_test() {
   echo ""
 }
 
+# ── config ────────────────────────────────────────────────
+cmd_config() {
+  local key="${1:-}"
+  local value="${2:-}"
+
+  if [ -z "$key" ]; then
+    echo ""
+    echo -e "${BOLD}session-snapshot — config${NC}"
+    echo ""
+    if [ -f "$CONFIG_DIR/config.json" ]; then
+      cat "$CONFIG_DIR/config.json"
+    else
+      echo "  No config file. Run 'session-snapshot install' first."
+    fi
+    echo ""
+    return
+  fi
+
+  case "$key" in
+    archiveDir|archive-dir)
+      if [ -z "$value" ]; then
+        fail "Usage: session-snapshot config archiveDir /path/to/dir"
+        exit 1
+      fi
+      # Expand ~ to $HOME
+      value="${value/#\~/$HOME}"
+      mkdir -p "$value"
+      node -e "
+const fs = require('fs');
+const f = '$CONFIG_DIR/config.json';
+let c = {}; try { c = JSON.parse(fs.readFileSync(f,'utf-8')); } catch {}
+c.archiveDir = '$value';
+fs.writeFileSync(f, JSON.stringify(c, null, 2) + '\n');
+"
+      ok "archiveDir set to: $value"
+      ;;
+    *)
+      fail "Unknown config key: $key"
+      echo "  Available: archiveDir"
+      exit 1
+      ;;
+  esac
+}
+
 # ── help ──────────────────────────────────────────────────────
 cmd_help() {
   echo ""
@@ -300,9 +435,11 @@ cmd_help() {
   echo "    clean             Remove all snapshots"
   echo "    test              Run self-test"
   echo ""
-  echo "  Wrapper:"
-  echo "    Use ${BOLD}cclaude${NC} instead of ${BOLD}claude${NC} to enable auto-restore."
-  echo "    cclaude --dangerously-skip-permissions"
+  echo "  Config:"
+  echo "    config                   Show current config"
+  echo "    config archiveDir PATH   Set archive directory (e.g. Google Drive)"
+  echo ""
+  echo "  After install, just use ${BOLD}claude${NC} as usual — auto-restore is built in."
   echo ""
 }
 
@@ -315,6 +452,7 @@ case "$COMMAND" in
   uninstall) cmd_uninstall ;;
   status)    cmd_status ;;
   clean)     cmd_clean ;;
+  config)    cmd_config "$@" ;;
   test)      cmd_test ;;
   help|--help|-h) cmd_help ;;
   *)

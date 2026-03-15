@@ -5,7 +5,7 @@
  * This is both a standalone module AND a claude-hooks plugin.
  */
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { findSessionJsonl, paths } from './claude-paths.ts';
 
 const DEBUG = process.env.SESSION_SNAPSHOT_DEBUG === '1' || process.env.CLAUDE_HOOKS_DEBUG === '1';
@@ -28,6 +28,32 @@ interface SnapshotState {
   lastSnapshotSize: number;
   snapshotCount: number;
   sessionId: string;
+}
+
+/**
+ * Extract a short project name from the JSONL path.
+ * Path looks like: ~/.claude/projects/-Users-vova-Documents-GitHub-myproject/abc.jsonl
+ * → "myproject"
+ */
+function projectNameFromPath(jsonlPath: string): string {
+  // Parent dir name is the hashed project path
+  const dirName = basename(join(jsonlPath, '..'));
+  // Take last segment (after last dash that follows a known separator)
+  const parts = dirName.split('-').filter(Boolean);
+  return parts[parts.length - 1] || 'unknown';
+}
+
+function archiveSnapshot(jsonlPath: string, sessionId: string): void {
+  try {
+    mkdirSync(paths.archiveDir, { recursive: true });
+    const project = projectNameFromPath(jsonlPath);
+    const shortId = sessionId.slice(0, 8);
+    const archivePath = join(paths.archiveDir, `${project}-${shortId}.jsonl`);
+    copyFileSync(jsonlPath, archivePath);
+    log(`Archived to ${archivePath}`);
+  } catch (err: any) {
+    log(`Archive error: ${err.message}`);
+  }
 }
 
 export function maybeSnapshot(sessionId: string): boolean {
@@ -66,6 +92,9 @@ export function maybeSnapshot(sessionId: string): boolean {
       snapshotSize: fileSize,
       timestamp: Date.now(),
     }));
+
+    // Archive: copy to archive dir (survives Claude Code cleanup)
+    archiveSnapshot(jsonlPath, sessionId);
 
     log(`Snapshot #${state.snapshotCount} saved (JSONL: ${(fileSize / 1024).toFixed(0)}KB)`);
     return true;

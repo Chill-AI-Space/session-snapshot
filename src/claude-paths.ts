@@ -2,18 +2,47 @@
  * Claude Code path discovery — finds session JSONLs on any machine.
  * Scans ~/.claude/projects/ directories, caches successful lookups.
  */
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const HOME = process.env.HOME || process.env.USERPROFILE || '/tmp';
+const CONFIG_DIR = join(HOME, '.config', 'session-snapshot');
+const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
+
+export interface Config {
+  archiveDir: string;
+}
+
+function loadConfig(): Config {
+  const defaults: Config = {
+    archiveDir: join(CONFIG_DIR, 'archive'),
+  };
+  try {
+    const raw = JSON.parse(readFileSync(CONFIG_FILE, 'utf-8'));
+    return { ...defaults, ...raw };
+  } catch {
+    return defaults;
+  }
+}
+
+export function saveConfig(config: Partial<Config>): void {
+  mkdirSync(CONFIG_DIR, { recursive: true });
+  let existing: Record<string, unknown> = {};
+  try { existing = JSON.parse(readFileSync(CONFIG_FILE, 'utf-8')); } catch {}
+  writeFileSync(CONFIG_FILE, JSON.stringify({ ...existing, ...config }, null, 2) + '\n');
+}
+
+export const config = loadConfig();
 
 export const paths = {
   home: HOME,
   projectsDir: join(HOME, '.claude', 'projects'),
-  configDir: join(HOME, '.config', 'session-snapshot'),
-  snapshotsDir: join(HOME, '.config', 'session-snapshot', 'snapshots'),
-  logsDir: join(HOME, '.config', 'session-snapshot', 'logs'),
-  cacheFile: join(HOME, '.config', 'session-snapshot', 'path-cache.json'),
+  configDir: CONFIG_DIR,
+  configFile: CONFIG_FILE,
+  snapshotsDir: join(CONFIG_DIR, 'snapshots'),
+  archiveDir: config.archiveDir,
+  logsDir: join(CONFIG_DIR, 'logs'),
+  cacheFile: join(CONFIG_DIR, 'path-cache.json'),
 } as const;
 
 type PathCache = Record<string, string>;
