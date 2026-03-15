@@ -8,11 +8,11 @@ When a Claude Code session hits context limits, the session crashes and all conv
 
 ## Solution
 
-**session-snapshot** does two things:
+**session-snapshot** does three things:
 
-1. **Saves snapshots** — a Claude Code hook that periodically copies the session JSONL file (every ~80KB of growth, once the session exceeds ~200KB). One rolling snapshot per session, always up to date.
+1. **Saves snapshots** — a Claude Code hook that periodically copies the session JSONL file (every ~80KB of growth, once the session exceeds ~200KB). One rolling snapshot per session (last state only), for auto-restore.
 
-2. **Archives sessions** — every snapshot is also saved to an archive directory that Claude Code won't clean up. Configurable — point it at Google Drive, Dropbox, or any shared folder.
+2. **Archives as Markdown** — converts each JSONL diff into readable `.md` files. No JSON noise — clean conversation blocks that Claude and humans can read natively. 15x smaller, 10-25x faster to search.
 
 3. **Auto-restores** — detects context overload when Claude exits and automatically restores the session from the last snapshot, resuming where you left off.
 
@@ -30,9 +30,10 @@ A [Claude Code hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that 
 - Rolling strategy: one snapshot per session, each new one overwrites the previous
 
 **What it produces:**
-- `~/.config/session-snapshot/snapshots/{sessionId}.jsonl` — byte-perfect copy of the session JSONL
-- `~/.config/session-snapshot/snapshots/{sessionId}.state.json` — tracks snapshot count and last size
+- `~/.config/session-snapshot/snapshots/{sessionId}.jsonl` — byte-perfect copy of the session JSONL (last state, for restore)
+- `~/.config/session-snapshot/snapshots/{sessionId}.state.json` — tracks snapshot count, last size, and last converted line
 - `~/.config/session-snapshot/snapshots/latest.json` — pointer to the most recent snapshot (session ID, paths, timestamp) used by the wrapper
+- `~/.config/session-snapshot/archive/{project}-{shortId}/NNN.md` — incremental MD diffs of the session conversation
 
 **Hook interface:** Exports a default object with `name`, `version`, and `run(input)`. Claude Code calls `run()` with `{ session_id, hook_event_name }` — the hook only acts on `PostToolUse`.
 
@@ -77,15 +78,17 @@ Management commands:
 ```
 ┌─────────────┐     PostToolUse hook      ┌──────────────────┐
 │ Claude Code  │ ──────────────────────►  │  snapshot.ts      │
-│  (session)   │                          │  copies JSONL     │
-└──────┬──────┘                          │  every ~80KB      │
-       │                                  └────────┬─────────┘
-       │ exits                                     │
-       ▼                                           ▼
-┌─────────────┐     detects overload     ┌──────────────────┐
-│  cclaude.sh  │ ◄────────────────────── │  snapshots/       │
-│  (wrapper)   │     restores JSONL      │  latest.json      │
-└─────────────┘                          └──────────────────┘
+│  (session)   │                          │  JSONL → snapshot  │
+└──────┬──────┘                          │  JSONL → MD diff   │
+       │                                  └───┬──────────┬────┘
+       │ exits                                │          │
+       ▼                                      ▼          ▼
+┌─────────────┐     detects overload     ┌────────┐  ┌────────┐
+│  cclaude.sh  │ ◄────────────────────── │snapshot │  │archive/│
+│  (wrapper)   │     restores JSONL      │ .jsonl  │  │ *.md   │
+└─────────────┘                          └────────┘  └────────┘
+                                          restore     reading
+                                          (last state) (diff chain)
 ```
 
 ## Install
@@ -131,7 +134,8 @@ session-snapshot test                              # Run self-test
 ```
 session-snapshot/
   src/
-    snapshot.ts         # Hook plugin — creates rolling JSONL snapshots
+    snapshot.ts         # Hook plugin — creates rolling JSONL snapshots + MD diffs
+    jsonl-to-md.ts      # JSONL → Markdown converter (deterministic, no AI)
     claude-paths.ts     # Finds session JSONL files across project dirs
   bin/
     cclaude.sh          # Wrapper — auto-restore loop around claude
@@ -140,11 +144,14 @@ session-snapshot/
 ~/.config/session-snapshot/
   config.json                   # Settings (archiveDir, etc.)
   snapshots/
-    {sessionId}.jsonl           # Rolling snapshot (overwritten each time)
-    {sessionId}.state.json      # Rolling state (count, last size)
+    {sessionId}.jsonl           # Rolling snapshot — last state only (for restore)
+    {sessionId}.state.json      # Rolling state (count, last size, last converted line)
     latest.json                 # Pointer for wrapper auto-restore
   archive/
-    {project}-{shortId}.jsonl   # Permanent session archive
+    {project}-{shortId}/        # One directory per session
+      001.md                    # MD diff chain — incremental, readable
+      002.md
+      003.md
   path-cache.json               # Cached session ID -> JSONL path mappings
   logs/
     snapshot.log                # Debug log (when enabled)

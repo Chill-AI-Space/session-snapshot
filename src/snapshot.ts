@@ -1,12 +1,14 @@
 /**
  * Rolling JSONL snapshot — saves a byte-perfect copy of the session JSONL
  * periodically, so if context overload kills the session, we can restore.
+ * Also generates incremental MD diffs for the archive.
  *
  * This is both a standalone module AND a claude-hooks plugin.
  */
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { findSessionJsonl, paths } from './claude-paths.ts';
+import { convertJsonlToMd } from './jsonl-to-md.ts';
 
 const DEBUG = process.env.SESSION_SNAPSHOT_DEBUG === '1' || process.env.CLAUDE_HOOKS_DEBUG === '1';
 const LOG_FILE = join(paths.logsDir, 'snapshot.log');
@@ -27,6 +29,7 @@ function log(msg: string): void {
 interface SnapshotState {
   lastSnapshotSize: number;
   snapshotCount: number;
+  lastConvertedLine: number;
   sessionId: string;
 }
 
@@ -36,23 +39,35 @@ interface SnapshotState {
  * → "myproject"
  */
 function projectNameFromPath(jsonlPath: string): string {
-  // Parent dir name is the hashed project path
   const dirName = basename(join(jsonlPath, '..'));
-  // Take last segment (after last dash that follows a known separator)
   const parts = dirName.split('-').filter(Boolean);
   return parts[parts.length - 1] || 'unknown';
 }
 
-function archiveSnapshot(jsonlPath: string, sessionId: string): void {
+/**
+ * Generate an incremental MD diff for new JSONL lines since last snapshot.
+ * Writes to archive/{project}-{shortId}/NNN.md
+ */
+function archiveMdDiff(jsonlPath: string, sessionId: string, state: SnapshotState): void {
   try {
-    mkdirSync(paths.archiveDir, { recursive: true });
     const project = projectNameFromPath(jsonlPath);
     const shortId = sessionId.slice(0, 8);
-    const archivePath = join(paths.archiveDir, `${project}-${shortId}.jsonl`);
-    copyFileSync(jsonlPath, archivePath);
-    log(`Archived to ${archivePath}`);
+    const sessionDir = join(paths.archiveDir, `${project}-${shortId}`);
+    mkdirSync(sessionDir, { recursive: true });
+
+    const fromLine = state.lastConvertedLine;
+    const md = convertJsonlToMd(jsonlPath, { fromLine });
+
+    // Don't write empty diffs
+    if (md.split('\n').length <= 7) return; // frontmatter only
+
+    const chunkNum = String(state.snapshotCount).padStart(3, '0');
+    const mdPath = join(sessionDir, `${chunkNum}.md`);
+    writeFileSync(mdPath, md);
+
+    log(`MD diff ${chunkNum} written (from L:${fromLine}) → ${mdPath}`);
   } catch (err: any) {
-    log(`Archive error: ${err.message}`);
+    log(`MD diff error: ${err.message}`);
   }
 }
 
@@ -71,7 +86,7 @@ export function maybeSnapshot(sessionId: string): boolean {
 
     // Read rolling state
     const stateFile = join(paths.snapshotsDir, `${sessionId}.state.json`);
-    let state: SnapshotState = { lastSnapshotSize: 0, snapshotCount: 0, sessionId };
+    let state: SnapshotState = { lastSnapshotSize: 0, snapshotCount: 0, lastConvertedLine: 0, sessionId };
     try { state = JSON.parse(readFileSync(stateFile, 'utf-8')); } catch {}
 
     if (fileSize - state.lastSnapshotSize < SNAPSHOT_INTERVAL) return false;
@@ -80,8 +95,15 @@ export function maybeSnapshot(sessionId: string): boolean {
     const snapshotPath = join(paths.snapshotsDir, `${sessionId}.jsonl`);
     copyFileSync(jsonlPath, snapshotPath);
 
+    // Count current lines for MD diff tracking
+    const totalLines = readFileSync(jsonlPath, 'utf-8').split('\n').filter(Boolean).length;
+
+    // Generate MD diff before updating state
+    archiveMdDiff(jsonlPath, sessionId, state);
+
     state.lastSnapshotSize = fileSize;
     state.snapshotCount++;
+    state.lastConvertedLine = totalLines;
     writeFileSync(stateFile, JSON.stringify(state));
 
     // Write latest.json for wrapper auto-restore
@@ -93,10 +115,7 @@ export function maybeSnapshot(sessionId: string): boolean {
       timestamp: Date.now(),
     }));
 
-    // Archive: copy to archive dir (survives Claude Code cleanup)
-    archiveSnapshot(jsonlPath, sessionId);
-
-    log(`Snapshot #${state.snapshotCount} saved (JSONL: ${(fileSize / 1024).toFixed(0)}KB)`);
+    log(`Snapshot #${state.snapshotCount} saved (JSONL: ${(fileSize / 1024).toFixed(0)}KB, MD diff L:${state.lastConvertedLine})`);
     return true;
   } catch (err: any) {
     log(`Snapshot error: ${err.message}`);
@@ -107,7 +126,7 @@ export function maybeSnapshot(sessionId: string): boolean {
 /** claude-hooks plugin interface */
 export default {
   name: 'session-snapshot',
-  version: '0.1.0',
+  version: '0.2.0',
   run(input: { session_id: string; hook_event_name: string }) {
     if (!input.session_id) return;
     // Only snapshot on PostToolUse (most frequent, gives best granularity)

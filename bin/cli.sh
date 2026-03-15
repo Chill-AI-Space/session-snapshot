@@ -256,9 +256,10 @@ cmd_status() {
     archive_dir=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$CONFIG_DIR/config.json','utf-8')).archiveDir || '$CONFIG_DIR/archive')" 2>/dev/null)
   fi
   if [ -d "$archive_dir" ]; then
-    local acount=$(ls "$archive_dir"/*.jsonl 2>/dev/null | wc -l | tr -d ' ')
+    local session_count=$(find "$archive_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    local md_count=$(find "$archive_dir" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
     local asize=$(du -sh "$archive_dir" 2>/dev/null | cut -f1)
-    ok "Archive: $acount session(s) ($asize) in $archive_dir"
+    ok "Archive: $session_count session(s), $md_count MD diffs ($asize) in $archive_dir"
   else
     warn "Archive: directory not found ($archive_dir)"
   fi
