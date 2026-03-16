@@ -15,7 +15,53 @@ ok()    { echo -e "${GREEN}  ✓${NC} $1"; }
 fail()  { echo -e "${RED}  ✗${NC} $1"; }
 warn()  { echo -e "${YELLOW}  !${NC} $1"; }
 
+HOOKS_DIR="$HOME/.config/claude-hooks"
+HOOKS_REGISTRY="$HOOKS_DIR/registry.json"
+HOOKS_VALIDATE="$HOOKS_DIR/validate-hooks.ts"
+PROJECT_NAME="session-snapshot"
 SHELL_MARKER="# session-snapshot: transparent wrapper"
+
+# ── registry helpers ─────────────────────────────────────────
+_register_hook() {
+  local key="$1"   # e.g. "PostToolUse/snapshot.ts"
+  local source="$2" # e.g. "/path/to/src/snapshot.ts"
+
+  # Ensure registry exists
+  if [ ! -f "$HOOKS_REGISTRY" ]; then
+    echo '{"version":1,"plugins":{}}' > "$HOOKS_REGISTRY"
+  fi
+
+  node -e "
+const fs = require('fs');
+const reg = JSON.parse(fs.readFileSync('$HOOKS_REGISTRY', 'utf-8'));
+reg.plugins['$key'] = {
+  project: '$PROJECT_NAME',
+  repo: '$REPO_DIR',
+  source: '$source',
+  installed: new Date().toISOString()
+};
+fs.writeFileSync('$HOOKS_REGISTRY', JSON.stringify(reg, null, 2) + '\n');
+"
+}
+
+_unregister_hook() {
+  local key="$1"
+  [ -f "$HOOKS_REGISTRY" ] || return 0
+  node -e "
+const fs = require('fs');
+const reg = JSON.parse(fs.readFileSync('$HOOKS_REGISTRY', 'utf-8'));
+delete reg.plugins['$key'];
+fs.writeFileSync('$HOOKS_REGISTRY', JSON.stringify(reg, null, 2) + '\n');
+"
+}
+
+_validate_all_hooks() {
+  if [ -f "$HOOKS_VALIDATE" ]; then
+    node --experimental-strip-types "$HOOKS_VALIDATE" "$@"
+  else
+    warn "validate-hooks.ts not found — skipping hook validation"
+  fi
+}
 
 _detect_shell_rc() {
   if [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "${SHELL:-bash}")" = "zsh" ]; then
@@ -103,7 +149,8 @@ EOF
     # Install via claude-hooks
     DEST="$HOOKS_PLUGINS/PostToolUse/snapshot.ts"
     ln -sf "$PLUGIN_SRC" "$DEST"
-    ok "Plugin installed: PostToolUse/snapshot.ts"
+    _register_hook "PostToolUse/snapshot.ts" "$PLUGIN_SRC"
+    ok "Plugin installed: PostToolUse/snapshot.ts (registered)"
   else
     warn "claude-hooks not found — installing plugin manually"
     # Fallback: register directly in settings.json
@@ -178,12 +225,13 @@ cmd_uninstall() {
   echo -e "${BOLD}session-snapshot — uninstall${NC}"
   echo ""
 
-  # Remove from claude-hooks
+  # Remove from claude-hooks + registry
   HOOKS_PLUGIN="$HOME/.config/claude-hooks/plugins/PostToolUse/snapshot.ts"
-  if [ -f "$HOOKS_PLUGIN" ]; then
+  if [ -f "$HOOKS_PLUGIN" ] || [ -L "$HOOKS_PLUGIN" ]; then
     rm "$HOOKS_PLUGIN"
     ok "Plugin removed from claude-hooks"
   fi
+  _unregister_hook "PostToolUse/snapshot.ts"
 
   # Remove from settings.json (standalone mode)
   SETTINGS="$HOME/.claude/settings.json"
@@ -364,6 +412,20 @@ cmd_test() {
     fail "Path discovery module failed: $RESULT"
   fi
 
+  # Validate all hooks (not just ours)
+  TOTAL=$((TOTAL + 1))
+  if _validate_all_hooks --json 2>/dev/null | node -e "
+    let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{
+      try { const r=JSON.parse(d); process.exit(r.issues.length > 0 ? 1 : 0); }
+      catch { process.exit(0); }
+    });
+  " 2>/dev/null; then
+    ok "All hooks healthy (no broken symlinks)"
+    PASS=$((PASS + 1))
+  else
+    fail "Broken hooks detected — run: session-snapshot validate --fix"
+  fi
+
   echo ""
   if [ "$PASS" -eq "$TOTAL" ]; then
     echo -e "  ${GREEN}${BOLD}All $TOTAL checks passed${NC}"
@@ -371,6 +433,11 @@ cmd_test() {
     echo -e "  ${YELLOW}${BOLD}$PASS/$TOTAL checks passed${NC}"
   fi
   echo ""
+}
+
+# ── validate ─────────────────────────────────────────────────
+cmd_validate() {
+  _validate_all_hooks "$@"
 }
 
 # ── config ────────────────────────────────────────────────
@@ -559,6 +626,8 @@ cmd_help() {
   echo "    status            Show snapshot info"
   echo "    clean             Remove all snapshots"
   echo "    test              Run self-test"
+  echo "    validate          Check all hooks are healthy"
+  echo "    validate --fix    Auto-remove broken hooks"
   echo ""
   echo "  Config:"
   echo "    config                   Show current config"
@@ -579,6 +648,7 @@ case "$COMMAND" in
   clean)     cmd_clean ;;
   config)    cmd_config "$@" ;;
   test)      cmd_test ;;
+  validate)  cmd_validate "$@" ;;
   view)      cmd_view "$@" ;;
   list|ls)   cmd_list ;;
   help|--help|-h) cmd_help ;;
