@@ -82,14 +82,14 @@ cmd_install() {
 
   # Create config dirs
   mkdir -p "$SNAPSHOTS_DIR"
-  mkdir -p "$CONFIG_DIR/archive"
+  mkdir -p "$CONFIG_DIR/md"
   ok "Config directory: $CONFIG_DIR"
 
   # Create default config if missing
   if [ ! -f "$CONFIG_DIR/config.json" ]; then
     cat > "$CONFIG_DIR/config.json" << EOF
 {
-  "archiveDir": "$CONFIG_DIR/archive"
+  "mdDir": "$CONFIG_DIR/md"
 }
 EOF
     ok "Config file created: $CONFIG_DIR/config.json"
@@ -250,18 +250,17 @@ cmd_status() {
     warn "Shell function: not installed (run 'session-snapshot install')"
   fi
 
-  # Show archive info
-  local archive_dir="$CONFIG_DIR/archive"
+  # Show MD cache info
+  local md_dir="$CONFIG_DIR/md"
   if [ -f "$CONFIG_DIR/config.json" ]; then
-    archive_dir=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$CONFIG_DIR/config.json','utf-8')).archiveDir || '$CONFIG_DIR/archive')" 2>/dev/null)
+    md_dir=$(node -e "const c=JSON.parse(require('fs').readFileSync('$CONFIG_DIR/config.json','utf-8')); console.log(c.mdDir || c.archiveDir || '$CONFIG_DIR/md')" 2>/dev/null)
   fi
-  if [ -d "$archive_dir" ]; then
-    local session_count=$(find "$archive_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
-    local md_count=$(find "$archive_dir" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
-    local asize=$(du -sh "$archive_dir" 2>/dev/null | cut -f1)
-    ok "Archive: $session_count session(s), $md_count MD diffs ($asize) in $archive_dir"
+  if [ -d "$md_dir" ]; then
+    local md_count=$(find "$md_dir" -name "*.md" -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
+    local msize=$(du -sh "$md_dir" 2>/dev/null | cut -f1)
+    ok "MD cache: $md_count session(s) ($msize) in $md_dir"
   else
-    warn "Archive: directory not found ($archive_dir)"
+    warn "MD cache: directory not found ($md_dir)"
   fi
 
   # Show snapshots
@@ -393,9 +392,9 @@ cmd_config() {
   fi
 
   case "$key" in
-    archiveDir|archive-dir)
+    mdDir|md-dir)
       if [ -z "$value" ]; then
-        fail "Usage: session-snapshot config archiveDir /path/to/dir"
+        fail "Usage: session-snapshot config mdDir /path/to/dir"
         exit 1
       fi
       # Expand ~ to $HOME
@@ -405,17 +404,137 @@ cmd_config() {
 const fs = require('fs');
 const f = '$CONFIG_DIR/config.json';
 let c = {}; try { c = JSON.parse(fs.readFileSync(f,'utf-8')); } catch {}
-c.archiveDir = '$value';
+c.mdDir = '$value';
 fs.writeFileSync(f, JSON.stringify(c, null, 2) + '\n');
 "
-      ok "archiveDir set to: $value"
+      ok "mdDir set to: $value"
       ;;
     *)
       fail "Unknown config key: $key"
-      echo "  Available: archiveDir"
+      echo "  Available: mdDir"
       exit 1
       ;;
   esac
+}
+
+# ── view ─────────────────────────────────────────────────────
+cmd_view() {
+  local session_id="${1:-}"
+  local tail_lines="${2:-100}"
+
+  # If no session ID, show latest or list sessions
+  if [ -z "$session_id" ]; then
+    # Try latest.json
+    if [ -f "$SNAPSHOTS_DIR/latest.json" ]; then
+      session_id=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$SNAPSHOTS_DIR/latest.json','utf-8')).sessionId)" 2>/dev/null)
+    fi
+    if [ -z "$session_id" ]; then
+      fail "No session ID provided and no latest session found."
+      echo ""
+      echo "  Usage: session-snapshot view <session-id> [--tail N] [--full] [--no-results]"
+      echo "         session-snapshot view latest"
+      echo ""
+      echo "  Find session IDs: session-snapshot list"
+      return 1
+    fi
+  fi
+
+  if [ "$session_id" = "latest" ]; then
+    if [ -f "$SNAPSHOTS_DIR/latest.json" ]; then
+      session_id=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$SNAPSHOTS_DIR/latest.json','utf-8')).sessionId)" 2>/dev/null)
+    else
+      fail "No latest session found."
+      return 1
+    fi
+  fi
+
+  # Parse remaining flags
+  shift 2>/dev/null || true
+  local full=false
+  local no_results=""
+  local tail_n="100"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --full) full=true ;;
+      --no-results) no_results="--no-results" ;;
+      --tail) shift; tail_n="${1:-100}" ;;
+      *) tail_n="$1" ;;
+    esac
+    shift
+  done
+
+  # Find the JSONL file — try exact match first, then prefix
+  local jsonl_path
+  jsonl_path=$(node --experimental-strip-types -e "
+    import { findSessionJsonl } from '$REPO_DIR/src/claude-paths.ts';
+    const p = findSessionJsonl('$session_id');
+    if (p) console.log(p);
+  " 2>/dev/null || true)
+
+  if [ -z "$jsonl_path" ]; then
+    # Try partial match (prefix)
+    jsonl_path=$(find "$HOME/.claude/projects" -name "${session_id}*.jsonl" -not -path "*/subagents/*" 2>/dev/null | head -1)
+  fi
+
+  if [ -z "$jsonl_path" ] || [ ! -f "$jsonl_path" ]; then
+    fail "Session not found: $session_id"
+    return 1
+  fi
+
+  local file_size=$(stat -f%z "$jsonl_path" 2>/dev/null || stat -c%s "$jsonl_path" 2>/dev/null)
+  local size_kb=$((file_size / 1024))
+
+  echo -e "${DIM}session: ${session_id}${NC}" >&2
+  echo -e "${DIM}source:  ${jsonl_path} (${size_kb}KB)${NC}" >&2
+
+  # Resolve full session ID from the JSONL filename
+  local full_sid=$(basename "$jsonl_path" .jsonl)
+
+  if [ "$full" = true ]; then
+    echo -e "${DIM}mode:    full (cached + incremental)${NC}" >&2
+    # Use view-session.ts which reads cached MD, appends new lines, outputs everything
+    node --experimental-strip-types "$REPO_DIR/src/view-session.ts" "$full_sid" "$jsonl_path" $no_results
+  else
+    echo -e "${DIM}mode:    tail ${tail_n} lines${NC}" >&2
+    node --experimental-strip-types "$REPO_DIR/src/jsonl-to-md.ts" "$jsonl_path" --tail "$tail_n" $no_results
+  fi
+}
+
+# ── list ─────────────────────────────────────────────────────
+cmd_list() {
+  echo ""
+  echo -e "${BOLD}session-snapshot — sessions${NC}"
+  echo ""
+
+  # Find all session JSONLs, sorted by modification time (newest first)
+  local found=0
+  while IFS= read -r jsonl; do
+    [ -f "$jsonl" ] || continue
+    local sid=$(basename "$jsonl" .jsonl)
+    local size=$(stat -f%z "$jsonl" 2>/dev/null || stat -c%s "$jsonl" 2>/dev/null)
+    local size_kb=$((size / 1024))
+    local dir=$(basename "$(dirname "$jsonl")")
+    local mod=$(stat -f"%Sm" -t"%Y-%m-%d %H:%M" "$jsonl" 2>/dev/null || stat -c"%y" "$jsonl" 2>/dev/null | cut -d. -f1)
+
+    # Extract project name
+    local project
+    project=$(node --experimental-strip-types -e "
+      import { extractProjectName } from '$REPO_DIR/src/jsonl-to-md.ts';
+      console.log(extractProjectName('$jsonl'));
+    " 2>/dev/null || echo "?")
+
+    echo -e "  ${CYAN}${sid:0:8}${NC}  ${size_kb}KB  ${DIM}${mod}${NC}  ${project}"
+    found=$((found + 1))
+  done < <(find "$HOME/.claude/projects" -name "*.jsonl" -not -path "*/subagents/*" 2>/dev/null | xargs ls -t 2>/dev/null | head -30)
+
+  if [ "$found" -eq 0 ]; then
+    echo "  No sessions found."
+  else
+    echo ""
+    echo -e "  ${DIM}Showing $found most recent. Use: session-snapshot view <id>${NC}"
+  fi
+  echo ""
 }
 
 # ── help ──────────────────────────────────────────────────────
@@ -426,6 +545,11 @@ cmd_help() {
   echo "  Auto-saves session state so context overload is recoverable."
   echo ""
   echo "  Usage: session-snapshot <command>"
+  echo ""
+  echo "  View:"
+  echo "    view [id] [--tail N]  Show session as Markdown (default: last 100 lines)"
+  echo "    view [id] --full      Show full session as Markdown"
+  echo "    list                  List recent sessions"
   echo ""
   echo "  Setup:"
   echo "    install           Install plugin + wrapper"
@@ -438,7 +562,7 @@ cmd_help() {
   echo ""
   echo "  Config:"
   echo "    config                   Show current config"
-  echo "    config archiveDir PATH   Set archive directory (e.g. Google Drive)"
+  echo "    config mdDir PATH        Set MD storage directory (e.g. Google Drive)"
   echo ""
   echo "  After install, just use ${BOLD}claude${NC} as usual — auto-restore is built in."
   echo ""
@@ -455,6 +579,8 @@ case "$COMMAND" in
   clean)     cmd_clean ;;
   config)    cmd_config "$@" ;;
   test)      cmd_test ;;
+  view)      cmd_view "$@" ;;
+  list|ls)   cmd_list ;;
   help|--help|-h) cmd_help ;;
   *)
     fail "Unknown command: $COMMAND"

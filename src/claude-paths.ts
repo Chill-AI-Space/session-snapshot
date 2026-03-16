@@ -10,26 +10,28 @@ const CONFIG_DIR = join(HOME, '.config', 'session-snapshot');
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
 
 export interface Config {
-  archiveDir: string;
+  mdDir: string;
 }
 
 function loadConfig(): Config {
   const defaults: Config = {
-    archiveDir: join(CONFIG_DIR, 'archive'),
+    mdDir: join(CONFIG_DIR, 'md'),
   };
   try {
     const raw = JSON.parse(readFileSync(CONFIG_FILE, 'utf-8'));
+    // Migrate: archiveDir → mdDir
+    if (raw.archiveDir && !raw.mdDir) raw.mdDir = raw.archiveDir;
     return { ...defaults, ...raw };
   } catch {
     return defaults;
   }
 }
 
-export function saveConfig(config: Partial<Config>): void {
+export function saveConfig(updates: Partial<Config>): void {
   mkdirSync(CONFIG_DIR, { recursive: true });
   let existing: Record<string, unknown> = {};
   try { existing = JSON.parse(readFileSync(CONFIG_FILE, 'utf-8')); } catch {}
-  writeFileSync(CONFIG_FILE, JSON.stringify({ ...existing, ...config }, null, 2) + '\n');
+  writeFileSync(CONFIG_FILE, JSON.stringify({ ...existing, ...updates }, null, 2) + '\n');
 }
 
 export const config = loadConfig();
@@ -40,7 +42,7 @@ export const paths = {
   configDir: CONFIG_DIR,
   configFile: CONFIG_FILE,
   snapshotsDir: join(CONFIG_DIR, 'snapshots'),
-  archiveDir: config.archiveDir,
+  mdDir: config.mdDir,
   logsDir: join(CONFIG_DIR, 'logs'),
   cacheFile: join(CONFIG_DIR, 'path-cache.json'),
 } as const;
